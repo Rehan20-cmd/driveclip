@@ -1,0 +1,6 @@
+{
+  "name": "DriveTrim",
+  "description": "High-performance Google Drive video trimming web application that extracts custom video segments via HTTP byte-range streaming and FFmpeg without requiring full-video downloads.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
