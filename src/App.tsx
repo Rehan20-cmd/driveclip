@@ -318,7 +318,7 @@ export default function App() {
           'Content-Type': 'application/json',
         };
         if (token) {
-          headers['Authorization'] = `Bearer ${token}`;
+          headers['X-Google-Access-Token'] = token;
         }
 
         const inspectEndpoint = sid
@@ -339,11 +339,29 @@ export default function App() {
               res = await fetch(inspectEndpoint, {
                 method: 'POST',
                 headers,
-                body: JSON.stringify({ url: targetUrl }),
+                body: JSON.stringify({
+                  url: targetUrl,
+                  accessToken: token || undefined,
+                }),
                 signal: inspectController.signal,
               });
             } finally {
               clearTimeout(timeoutId);
+            }
+
+            // If an authenticated request returned 401/403 (e.g. expired token or public link owned by another user),
+            // automatically retry once in anonymous/public mode before failing.
+            if (res && (res.status === 401 || res.status === 403) && (token || sid)) {
+              const publicRetryRes = await fetch('/api/video/inspect?skipAuth=1', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: targetUrl, skipAuth: true }),
+                signal: inspectController.signal,
+              });
+              if (publicRetryRes.ok) {
+                res = publicRetryRes;
+                break;
+              }
             }
 
             // Retry only on transient gateway/server errors (502, 503, 504)
@@ -373,10 +391,10 @@ export default function App() {
         }
 
         if (!res.ok) {
-          console.error('[DriveTrim:Inspect:Error]', {
+          console.warn('[DriveTrim:Inspect:Error]', {
             status: res.status,
-            code: data.code,
-            error: data.error,
+            code: data.code || 'HTTP_' + res.status,
+            error: data.error || res.statusText || 'Request failed',
           });
 
           let errorCode = data.code || 'ERROR';
@@ -816,7 +834,7 @@ export default function App() {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
       };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
+      if (token) headers['X-Google-Access-Token'] = token;
 
       const res = await fetch('/api/trim/start', {
         method: 'POST',
@@ -828,6 +846,7 @@ export default function App() {
           trimMode,
           outputFormat,
           allowFullStreamFallback,
+          accessToken: token || undefined,
         }),
       });
 
@@ -1169,8 +1188,10 @@ export default function App() {
       const res = await fetch(`/api/trim/save-to-drive/${activeJob.jobId}`, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-Google-Access-Token': token,
         },
+        body: JSON.stringify({ accessToken: token }),
       });
 
       const data = await res.json();

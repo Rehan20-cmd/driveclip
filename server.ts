@@ -322,6 +322,20 @@ function parseCookieHeader(cookieHeader?: string): Record<string, string> {
 }
 
 function extractRequestOAuthToken(req: Request, meta?: VideoSourceMetadata): string | undefined {
+  if (req.body?.skipAuth === true || req.query.skipAuth === '1') {
+    return undefined;
+  }
+
+  const xGoogleToken = req.headers['x-google-access-token'];
+  if (typeof xGoogleToken === 'string' && xGoogleToken.trim()) {
+    return xGoogleToken.trim();
+  }
+
+  const bodyToken = req.body?.accessToken;
+  if (typeof bodyToken === 'string' && bodyToken.trim()) {
+    return bodyToken.trim();
+  }
+
   const authHeader = req.headers.authorization;
   if (authHeader?.startsWith('Bearer ')) {
     const bearer = authHeader.slice(7).trim();
@@ -897,7 +911,10 @@ interface DriveViewerPlaybackInfo {
   posterUrl?: string;
 }
 
-async function resolveDriveViewerPlayback(fileId: string): Promise<DriveViewerPlaybackInfo | null> {
+async function resolveDriveViewerPlayback(
+  fileId: string,
+  oauthToken?: string
+): Promise<DriveViewerPlaybackInfo | null> {
   try {
     const previewPageUrl = `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/preview`;
     const previewFetch = await fetchWithCookieJar(previewPageUrl, {
@@ -905,18 +922,21 @@ async function resolveDriveViewerPlayback(fileId: string): Promise<DriveViewerPl
     });
     const previewRes = previewFetch.response;
 
+    let html = '';
     if (
-      !previewRes.ok ||
-      previewFetch.finalUrl.includes('accounts.google.com') ||
-      previewFetch.finalUrl.includes('ServiceLogin')
+      previewRes.ok &&
+      !previewFetch.finalUrl.includes('accounts.google.com') &&
+      !previewFetch.finalUrl.includes('ServiceLogin')
     ) {
+      html = await previewRes.text();
+    } else {
       try {
         await previewRes.body?.cancel();
       } catch {}
-      return null;
+      if (!oauthToken) {
+        return null;
+      }
     }
-
-    const html = await previewRes.text();
 
     const ogTitleMatch =
       html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i) ||
@@ -942,15 +962,31 @@ async function resolveDriveViewerPlayback(fileId: string): Promise<DriveViewerPl
       fileId
     )}/playback?key=${encodeURIComponent(viewerApiKey)}`;
 
-    const pbRes = await fetch(playbackApiUrl, {
+    let pbRes = await fetch(playbackApiUrl, {
       headers: {
         'User-Agent': BROWSER_USER_AGENT,
         Referer: 'https://drive.google.com/',
         Origin: 'https://drive.google.com',
         ...(previewFetch.cookieHeader ? { Cookie: previewFetch.cookieHeader } : {}),
+        ...(oauthToken ? { Authorization: `Bearer ${oauthToken}` } : {}),
       },
       signal: AbortSignal.timeout(9000),
     });
+
+    if (!pbRes.ok && oauthToken) {
+      try {
+        await pbRes.body?.cancel();
+      } catch {}
+      pbRes = await fetch(playbackApiUrl, {
+        headers: {
+          'User-Agent': BROWSER_USER_AGENT,
+          Referer: 'https://drive.google.com/',
+          Origin: 'https://drive.google.com',
+          ...(previewFetch.cookieHeader ? { Cookie: previewFetch.cookieHeader } : {}),
+        },
+        signal: AbortSignal.timeout(9000),
+      });
+    }
 
     if (!pbRes.ok) {
       try {
@@ -1557,9 +1593,15 @@ async function inspectDriveVideo(
     }
 
     if (driveRes.status === 404) {
-      throw new Error(
-        'NOT_FOUND: This Google Drive file does not exist, has been deleted, or your account does not have permission to view it.'
-      );
+      // An OAuth token with drive.file scope returns 404 on public links not created by the app.
+      // Always try the public resolver before failing with 404.
+      try {
+        return await inspectDriveVideo(fileId, undefined, forceRefresh);
+      } catch {
+        throw new Error(
+          'NOT_FOUND: This Google Drive file does not exist, has been deleted, or your account does not have permission to view it.'
+        );
+      }
     }
 
     if (driveRes.status === 429) {
@@ -1586,18 +1628,25 @@ async function inspectDriveVideo(
         );
       }
 
-      if (driveData.capabilities && driveData.capabilities.canDownload === false) {
-        throw new Error(
-          'ACCESS_DENIED: The owner of this Google Drive video has disabled downloading and streaming for viewers.'
-        );
-      }
-
       const streamUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(
         fileId
-      )}?alt=media&supportsAllDrives=true`;
+      )}?alt=media&supportsAllDrives=true&acknowledgeAbuse=true`;
 
-      // Also resolve Drive Viewer CDN in parallel so HEVC/quota files have an instant H.264/AAC stream ready
-      const viewerPromise = resolveDriveViewerPlayback(fileId);
+      // Also resolve Drive Viewer CDN in parallel so HEVC/quota/canDownload:false files have an instant H.264/AAC stream ready
+      const viewerPromise = resolveDriveViewerPlayback(fileId, oauthToken);
+
+      if (driveData.capabilities && driveData.capabilities.canDownload === false) {
+        const viewerForRestricted = await viewerPromise;
+        if (!viewerForRestricted) {
+          try {
+            return await inspectDriveVideo(fileId, undefined, forceRefresh);
+          } catch {
+            throw new Error(
+              'ACCESS_DENIED: The owner of this Google Drive video has disabled downloading and streaming for viewers.'
+            );
+          }
+        }
+      }
 
       // Verify media stream accessibility & HTTP Range support via a fast 64 KB check
       const mediaCheck = await fetchWithCookieJar(streamUrl, {
@@ -1618,12 +1667,13 @@ async function inspectDriveVideo(
       const viewer = await viewerPromise;
 
       if (mediaRes.status === 401) {
-        if (viewer) {
+        try {
           return await inspectDriveVideo(fileId, undefined, forceRefresh);
+        } catch {
+          throw new Error(
+            'AUTH_REQUIRED: Your Google Sign-In session has expired. Please sign in with Google again.'
+          );
         }
-        throw new Error(
-          'AUTH_REQUIRED: Your Google Sign-In session has expired. Please sign in with Google again.'
-        );
       }
       if (
         mediaRes.status === 403 ||
@@ -1668,14 +1718,19 @@ async function inspectDriveVideo(
           metadataCache.set(fileId, metaFromViewer);
           return metaFromViewer;
         }
-        if (mediaRes.status === 429) {
+        // Try public resolver before failing with 403/429
+        try {
+          return await inspectDriveVideo(fileId, undefined, forceRefresh);
+        } catch {
+          if (mediaRes.status === 429) {
+            throw new Error(
+              'QUOTA_EXCEEDED: Google Drive download quota exceeded for this file. Please try again later.'
+            );
+          }
           throw new Error(
-            'QUOTA_EXCEEDED: Google Drive download quota exceeded for this file. Please try again later.'
+            'ACCESS_DENIED: Google Drive blocked media streaming for this file (download permission denied or download quota exceeded).'
           );
         }
-        throw new Error(
-          'ACCESS_DENIED: Google Drive blocked media streaming for this file (download permission denied or download quota exceeded).'
-        );
       }
 
       let durationSeconds = driveData.videoMediaMetadata?.durationMillis
@@ -2243,9 +2298,11 @@ async function startServer() {
   app.post('/api/auth/session', async (req: Request, res: Response) => {
     try {
       const { accessToken, userEmail, userName } = req.body || {};
+      const xGoogleToken = req.headers['x-google-access-token'];
       const authHeader = req.headers.authorization;
       const token =
         (typeof accessToken === 'string' && accessToken.trim()) ||
+        (typeof xGoogleToken === 'string' && xGoogleToken.trim()) ||
         (authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : '');
 
       if (!token) {

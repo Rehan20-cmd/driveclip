@@ -36,7 +36,7 @@ async function syncBackendOAuthSession(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`,
+        'X-Google-Access-Token': accessToken,
       },
       body: JSON.stringify({
         accessToken,
